@@ -1,5 +1,5 @@
 """
-Deriv Multi-Symbol Rise/Fall Trading Bot - FULL POWER  v2
+Deriv Multi-Symbol Rise/Fall Trading Bot - FULL POWER  v3
 ==========================================================
 Single-file bot. Scans all eligible synthetic-index symbols, runs an
 18-layer intelligence pipeline per symbol using fitted statistical models,
