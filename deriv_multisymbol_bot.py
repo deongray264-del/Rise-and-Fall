@@ -188,7 +188,7 @@ OTP_PATH = "/trading/v1/options/accounts/{account_id}/otp"
 MIN_STAKE = 0.35
 STAKE_PCT = 0.02                       # stake = max(MIN_STAKE, balance * STAKE_PCT)
 
-MARTINGALE_FACTOR    = 1.24
+MARTINGALE_FACTOR    = 1.3
 MARTINGALE_MAX_STEPS = 2               # FIX v2: Reduced from 3 → 2.
                                        # 3-step at 2% risk: step0+step1+step2+step3 can
                                        # consume 2%+2.5%+3.1%+3.8% = 11.4% of balance in
@@ -249,7 +249,7 @@ ADAPTIVE_THRESHOLD_PERCENTILE = 75
 # to improve models but the broken Hurst meant it was calibrating on corrupted
 # features. Use scheduled 2-hour recal only — sufficient for synthetics.
 POST_LOSS_DEEP_RECAL = False
-CANDIDATE_DURATIONS = [1, 3, 5, 7, 10]
+CANDIDATE_DURATIONS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 
 # FIX v2: Reduced MC_SIMULATIONS from 50000 → 8000.
 # The calibration wall time was 688 seconds (11.5 min) for 8 symbols.
@@ -258,7 +258,7 @@ CANDIDATE_DURATIONS = [1, 3, 5, 7, 10]
 # standard error of sqrt(0.5*0.5/8000) = 0.0056 — more than sufficient to
 # distinguish 0.52 from 0.51 with high confidence. This reduces calibration
 # time by ~80% while retaining statistical validity.
-MC_SIMULATIONS = 8000
+MC_SIMULATIONS = 75000
 
 WATCHDOG_TIMEOUT = 5 * 60
 WATCHDOG_CHECK_INTERVAL = 20
