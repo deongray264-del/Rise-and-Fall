@@ -1,5 +1,5 @@
 """
-Deriv Multi-Symbol Rise/Fall Trading Bot - FULL POWER  v3
+Deriv Multi-Symbol Rise/Fall Trading Bot - FULL POWER  v2
 ==========================================================
 Single-file bot. Scans all eligible synthetic-index symbols, runs an
 18-layer intelligence pipeline per symbol using fitted statistical models,
@@ -214,8 +214,21 @@ CONFIDENCE_THRESHOLD_DEFAULT = 0.11    # fallback only — real threshold set ad
 MIN_SCORE_GAP = 0.05
 
 # ── Layer agreement gate ──────────────────────────────────────────────────
-MIN_LAYER_AGREE    = 11
-MAX_LAYER_DISAGREE = 3
+# FIX v3: Lowered 12/3 → 9/4 based on actual demo log analysis (2026-06-30).
+# Of 150 rejected signals: 0 reached 11, but 26 hit exactly 10 and 31 hit
+# exactly 9 — the distribution clustered just below the bar, not far below
+# it. At 12/3 only 2 trade sequences completed in 3.7 hours, leaving almost
+# nothing for the new entropy/confluence/bootstrap gates to evaluate (they
+# rejected only 12 signals combined vs. 150 from this gate alone). Lowering
+# to 9/4 (56% supermajority, was 75%) should let ~38% of candidates through
+# to the new gates, which are now responsible for doing the real selection
+# work instead of mostly sitting idle downstream of an already-empty funnel.
+# NOTE: lowering this gate alone does not by itself raise trade quality —
+# it shifts more of the filtering burden onto entropy/confluence/bootstrap.
+# Watch their rejection rates after this change; if they stay near-idle while
+# win rate degrades, the new gates need tightening, not this one loosening further.
+MIN_LAYER_AGREE    = 9
+MAX_LAYER_DISAGREE = 4
 
 # ── Monte Carlo quality floor ─────────────────────────────────────────────
 # FIX v2: Lowered from 0.52 → 0.505. The MC was blocking 186 signals because
@@ -407,17 +420,34 @@ class SupabaseStore:
                     print(f"[Store] Restored direction_history "
                           f"({len(state.direction_history)} entries).")
 
+    # FIX v2: Schema version stamp on saved gates.
+    # Without this, a gate row saved by an OLDER bot version (e.g. the
+    # original pre-multi-gate-stack bot) silently overrides the new
+    # hardcoded defaults on every restart via load_gates() below — exactly
+    # what happened after the v2 deploy: logs showed "need >=11 agree" even
+    # though v2.py hardcodes MIN_LAYER_AGREE=12, because the stale value from
+    # a previous run's autotune_gates() was still sitting in bot_gate_config.
+    # Bump GATE_SCHEMA_VERSION any time the gate stack's semantics change
+    # (e.g. adding/removing a sequential filter) to force a clean reset.
     def save_gates(self, min_agree, max_disagree, min_exp_wr, adaptive_thr):
-        for key, val in [("min_layer_agree", float(min_agree)),
+        for key, val in [("min_layer_agree",    float(min_agree)),
                          ("max_layer_disagree", float(max_disagree)),
                          ("min_exp_win_rate",   float(min_exp_wr)),
-                         ("adaptive_threshold", float(adaptive_thr))]:
+                         ("adaptive_threshold", float(adaptive_thr)),
+                         ("gate_schema_version", float(GATE_SCHEMA_VERSION))]:
             self._upsert("bot_gate_config", {"key": key, "value": round(val, 6),
                                               "updated_at": datetime.utcnow().isoformat()})
 
     def load_gates(self):
         rows = self._select("bot_gate_config", "select=key,value")
-        return {row["key"]: float(row["value"]) for row in rows}
+        gates = {row["key"]: float(row["value"]) for row in rows}
+        saved_version = gates.get("gate_schema_version", -1)
+        if saved_version != GATE_SCHEMA_VERSION:
+            print(f"[Store] Gate config schema mismatch "
+                  f"(saved={saved_version}, current={GATE_SCHEMA_VERSION}) — "
+                  f"ignoring stale persisted gates, using code defaults.")
+            return {}
+        return gates
 
 
 # Module-level store singleton — instantiated once in main()
@@ -952,15 +982,75 @@ def markov_directional_prob(returns, order=2, alpha_smooth=1.0):
 # LAYER 2: HIDDEN MARKOV MODEL (real Baum-Welch fit via hmmlearn)
 # ---------------------------------------------------------------------------
 def fit_hmm(returns, n_states=3):
+    """
+    FIX v2: HMM degeneracy fix.
+
+    The live logs showed 'HMM state 2 stationary prob=0.000 (degenerate)' on
+    every single calibration cycle. This means the 3-state model's transition
+    matrix orphans one state — once posterior probability leaves it, the
+    chain can essentially never return. The model is then fitting 3 Gaussian
+    components via EM when the data only supports ~2 genuine regimes at tick
+    level, which produces an unstable, wasted third state and can pull the
+    other two components' parameters off in the process (EM splits
+    responsibility three ways even when one share is structurally near-zero).
+
+    Fix has two parts:
+      1. Multi-seed fitting: try several random initialisations and keep the
+         one with the best log-likelihood AND no degenerate state. A single
+         fixed random_state=42 can land in a poor local optimum every time;
+         trying 4 seeds and selecting on both fit quality and stability
+         catches cases where a better-conditioned solution exists nearby.
+      2. Automatic fallback to n_states=2 if no 3-state fit clears the
+         degeneracy bar after all attempts. Tick-level synthetic index
+         returns are close to white noise with mild regime-switching
+         volatility; 2 states (calm/excited) is frequently the right
+         complexity, and a working 2-state model beats a broken 3-state one.
+    """
     if len(returns) < MIN_TICKS_FOR_FIT:
         return None
-    try:
-        X = returns.reshape(-1, 1)
-        model = GaussianHMM(n_components=n_states, covariance_type="diag", n_iter=80, random_state=42)
-        model.fit(X)
+
+    X = returns.reshape(-1, 1)
+
+    def _try_fit(k, seeds=(42, 7, 123, 2024)):
+        best_model, best_score = None, -np.inf
+        for seed in seeds:
+            try:
+                m = GaussianHMM(n_components=k, covariance_type="diag",
+                                n_iter=100, random_state=seed,
+                                min_covar=1e-4)
+                m.fit(X)
+                score = m.score(X)
+                # Check for degeneracy
+                stat_dist = m.get_stationary_distribution()
+                is_degenerate = bool(np.min(stat_dist) < 0.05)
+                if not is_degenerate and score > best_score:
+                    best_model, best_score = m, score
+            except Exception:
+                continue
+        return best_model
+
+    # Attempt 1: requested state count (default 3), non-degenerate only
+    model = _try_fit(n_states)
+    if model is not None:
         return model
+
+    # Fallback: 2-state model — nearly always well-conditioned on tick data
+    if n_states > 2:
+        print(f"[HMM] {n_states}-state fit degenerate on all seeds — "
+              f"falling back to 2-state model.")
+        model = _try_fit(2)
+        if model is not None:
+            return model
+
+    # Last resort: accept the original fixed-seed fit even if borderline,
+    # rather than running with no HMM signal at all.
+    try:
+        m = GaussianHMM(n_components=2, covariance_type="diag",
+                        n_iter=100, random_state=42, min_covar=1e-4)
+        m.fit(X)
+        return m
     except Exception as e:
-        print(f"[HMM] fit failed: {e}")
+        print(f"[HMM] fit failed entirely: {e}")
         return None
 
 
@@ -1941,8 +2031,16 @@ def autotune_gates(state):
             print(f"[AutoTune] WR={wr:.3f} over {total_trades} trades < 0.46 → TIGHTENED: "
                   f"agree>={MIN_LAYER_AGREE} disagree<={MAX_LAYER_DISAGREE} MC>={MIN_EXP_WIN_RATE:.2f}")
     elif wr > 0.54 and total_trades >= 100:
-        new_agree = max(MIN_LAYER_AGREE - 1, 10)
-        new_dis   = min(MAX_LAYER_DISAGREE + 1, 4)
+        # FIX v3: floor lowered 10→7, disagree ceiling raised 4→6.
+        # The previous floor of 10 meant autotune could never relax below
+        # the level that was already starving the bot of trades (confirmed:
+        # it settled at 11, one step above its own floor of 10). With the
+        # new 9/4 starting point and a real floor of 7/6, autotune now has
+        # genuine room to explore toward more trade flow if win rate stays
+        # healthy, rather than oscillating against a ceiling that was set
+        # before the new downstream gates existed to share the filtering load.
+        new_agree = max(MIN_LAYER_AGREE - 1, 7)
+        new_dis   = min(MAX_LAYER_DISAGREE + 1, 6)
         new_mc    = max(MIN_EXP_WIN_RATE - 0.01, 0.50)
         if (new_agree, new_dis, new_mc) != (MIN_LAYER_AGREE, MAX_LAYER_DISAGREE, MIN_EXP_WIN_RATE):
             MIN_LAYER_AGREE, MAX_LAYER_DISAGREE, MIN_EXP_WIN_RATE = new_agree, new_dis, new_mc
@@ -2688,6 +2786,11 @@ def check_model_stability(models, symbol):
             warns.append(f"OU theta={theta:.4f} <= 0 (divergent)")
     if models.hmm_model is not None:
         try:
+            # FIX v2: fit_hmm() now actively avoids degenerate states via
+            # multi-seed fitting + automatic 2-state fallback, so this should
+            # rarely fire anymore. Kept as a safety-net diagnostic — if it
+            # still appears in logs after the fix, the fallback chain itself
+            # failed and is worth investigating directly.
             for i, p in enumerate(models.hmm_model.get_stationary_distribution()):
                 if p < 0.05:
                     warns.append(f"HMM state {i} stationary prob={p:.3f} (degenerate)")
