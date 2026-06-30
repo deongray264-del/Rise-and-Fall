@@ -214,7 +214,7 @@ CONFIDENCE_THRESHOLD_DEFAULT = 0.11    # fallback only — real threshold set ad
 MIN_SCORE_GAP = 0.05
 
 # ── Layer agreement gate ──────────────────────────────────────────────────
-MIN_LAYER_AGREE    = 12
+MIN_LAYER_AGREE    = 11
 MAX_LAYER_DISAGREE = 3
 
 # ── Monte Carlo quality floor ─────────────────────────────────────────────
