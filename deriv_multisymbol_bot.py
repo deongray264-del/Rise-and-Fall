@@ -188,7 +188,7 @@ OTP_PATH = "/trading/v1/options/accounts/{account_id}/otp"
 MIN_STAKE = 0.35
 STAKE_PCT = 0.02                       # stake = max(MIN_STAKE, balance * STAKE_PCT)
 
-MARTINGALE_FACTOR    = 1.24
+MARTINGALE_FACTOR    = 1.3
 MARTINGALE_MAX_STEPS = 2               # FIX v2: Reduced from 3 → 2.
                                        # 3-step at 2% risk: step0+step1+step2+step3 can
                                        # consume 2%+2.5%+3.1%+3.8% = 11.4% of balance in
@@ -236,7 +236,7 @@ GATE_SCHEMA_VERSION = 2
 # it shifts more of the filtering burden onto entropy/confluence/bootstrap.
 # Watch their rejection rates after this change; if they stay near-idle while
 # win rate degrades, the new gates need tightening, not this one loosening further.
-MIN_LAYER_AGREE    = 9
+MIN_LAYER_AGREE    = 8
 MAX_LAYER_DISAGREE = 4
 
 # ── Monte Carlo quality floor ─────────────────────────────────────────────
