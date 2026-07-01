@@ -406,17 +406,15 @@ class SupabaseStore:
                 state.payout_history[s] = payouts
         print(f"[Store] Warm-started state for {len(rows)} symbols from Supabase.")
 
-
     def save_global_state(self, state):
-        """Persist global (non-per-symbol) self-improvement state.
-        FIX v3: also persist balance peak for drawdown tracking.
-        Previously only saved after trade closes — with only 3 trades in the
-        session, direction_history only had 3 entries in Supabase. Now called
-        periodically by the heartbeat so the window stays warm across restarts."""
-        hist = list(state.direction_history)[-30:]
+        """FIX v2: Persist global (non-per-symbol) self-improvement state —
+        currently the rolling direction-balance history used by bayesian_fusion's
+        bias correction. Without this, every Railway restart loses the bot's
+        memory of recent CALL/PUT skew and the correction has to rebuild from
+        zero, leaving a brief window of unprotected bias after every redeploy."""
         self._upsert("bot_global_state", {
             "key":        "direction_history",
-            "value":      json.dumps(hist),
+            "value":      json.dumps(state.direction_history[-30:]),
             "updated_at": datetime.utcnow().isoformat(),
         })
 
@@ -425,23 +423,11 @@ class SupabaseStore:
         for row in rows:
             if row["key"] == "direction_history":
                 raw = row.get("value") or "[]"
-                # Supabase may return JSONB as already-parsed list or as string
-                if isinstance(raw, str):
-                    try:
-                        hist = json.loads(raw)
-                    except Exception:
-                        hist = []
-                elif isinstance(raw, list):
-                    hist = raw
-                else:
-                    hist = []
-                # Ensure all entries are plain Python ints
-                hist = [int(d) for d in hist if d in (1, -1)]
+                hist = json.loads(raw) if isinstance(raw, str) else (raw or [])
                 if hist:
                     state.direction_history = hist[-30:]
                     print(f"[Store] Restored direction_history "
-                          f"({len(state.direction_history)} entries, "
-                          f"call_ratio={sum(1 for d in hist if d==1)/len(hist):.0%}).")
+                          f"({len(state.direction_history)} entries).")
 
     # FIX v2: Schema version stamp on saved gates.
     # Without this, a gate row saved by an OLDER bot version (e.g. the
@@ -1004,22 +990,30 @@ def markov_directional_prob(returns, order=2, alpha_smooth=1.0):
 # ---------------------------------------------------------------------------
 # LAYER 2: HIDDEN MARKOV MODEL (real Baum-Welch fit via hmmlearn)
 # ---------------------------------------------------------------------------
-def fit_hmm(returns, n_states=2):
+def fit_hmm(returns, n_states=3):
     """
-    FIX v3: Default changed from n_states=3 to n_states=2.
+    FIX v2: HMM degeneracy fix.
 
-    Live log analysis confirmed 'falling back to 2-state model' appeared for
-    EVERY symbol on EVERY calibration cycle without exception. The 3-state
-    attempt was burning through 4 random seeds (all failing the degeneracy
-    check) before falling back to 4 more 2-state seeds — wasting ~50% of
-    HMM fitting compute on a path that was universally rejected. Tick-level
-    synthetic index returns only support 2 genuine regimes (calm/excited),
-    so 2-state is the correct model complexity. Defaulting to it directly
-    eliminates the wasted 3-state seed attempts and gives the 2-state model
-    a cleaner, faster fit on every calibration cycle.
-    The multi-seed and degeneracy-check logic is kept in case a caller
-    explicitly requests n_states=3 in future, but normal operation no longer
-    hits it.
+    The live logs showed 'HMM state 2 stationary prob=0.000 (degenerate)' on
+    every single calibration cycle. This means the 3-state model's transition
+    matrix orphans one state — once posterior probability leaves it, the
+    chain can essentially never return. The model is then fitting 3 Gaussian
+    components via EM when the data only supports ~2 genuine regimes at tick
+    level, which produces an unstable, wasted third state and can pull the
+    other two components' parameters off in the process (EM splits
+    responsibility three ways even when one share is structurally near-zero).
+
+    Fix has two parts:
+      1. Multi-seed fitting: try several random initialisations and keep the
+         one with the best log-likelihood AND no degenerate state. A single
+         fixed random_state=42 can land in a poor local optimum every time;
+         trying 4 seeds and selecting on both fit quality and stability
+         catches cases where a better-conditioned solution exists nearby.
+      2. Automatic fallback to n_states=2 if no 3-state fit clears the
+         degeneracy bar after all attempts. Tick-level synthetic index
+         returns are close to white noise with mild regime-switching
+         volatility; 2 states (calm/excited) is frequently the right
+         complexity, and a working 2-state model beats a broken 3-state one.
     """
     if len(returns) < MIN_TICKS_FOR_FIT:
         return None
@@ -1035,6 +1029,7 @@ def fit_hmm(returns, n_states=2):
                                 min_covar=1e-4)
                 m.fit(X)
                 score = m.score(X)
+                # Check for degeneracy
                 stat_dist = m.get_stationary_distribution()
                 is_degenerate = bool(np.min(stat_dist) < 0.05)
                 if not is_degenerate and score > best_score:
@@ -1043,12 +1038,12 @@ def fit_hmm(returns, n_states=2):
                 continue
         return best_model
 
-    # Direct 2-state fit — no wasted 3-state attempts
+    # Attempt 1: requested state count (default 3), non-degenerate only
     model = _try_fit(n_states)
     if model is not None:
         return model
 
-    # Fallback: try higher state count if explicitly requested and 2-state failed
+    # Fallback: 2-state model — nearly always well-conditioned on tick data
     if n_states > 2:
         print(f"[HMM] {n_states}-state fit degenerate on all seeds — "
               f"falling back to 2-state model.")
@@ -1056,7 +1051,8 @@ def fit_hmm(returns, n_states=2):
         if model is not None:
             return model
 
-    # Last resort: accept borderline fit rather than no HMM signal at all
+    # Last resort: accept the original fixed-seed fit even if borderline,
+    # rather than running with no HMM signal at all.
     try:
         m = GaussianHMM(n_components=2, covariance_type="diag",
                         n_iter=100, random_state=42, min_covar=1e-4)
@@ -1356,89 +1352,42 @@ def compute_stoch_rsi(prices, rsi_period=14, stoch_period=14, momentum_mode=Fals
     return float(stoch_k), float(np.clip(signal, -1, 1))
 
 
-def compute_adx(prices, period=14, bar_size=5):
-    """L14: ADX trend-strength filter on BAR data, not raw ticks.
-
-    FIX v3: ADX was permanently 0.0000 on all 11 live trades even after the
-    v2 threshold fix (20→12). Root cause: tick-to-tick price differences on
-    Deriv synthetic indices are at floating-point noise level (O(0.0001)).
-    PDM and NDM at that resolution are also O(0.0001), making ATR≈0 and
-    producing ADX≈0 regardless of actual trend strength.
-
-    Fix: aggregate raw ticks into `bar_size`-tick bars (same approach used
-    by multi_timeframe_confluence) before computing ADX. At 5-tick bars the
-    bar-to-bar price differences are O(0.001-0.01) — large enough for ATR
-    to be non-zero and for PDM/NDM to carry directional information.
-    Requires period * bar_size * 2 raw ticks (140 ticks with defaults).
-
+def compute_adx(prices, period=14):
+    """L14: ADX trend-strength filter. ADX > 25 = trending, ADX < 20 = ranging.
     Returns (adx_value, trend_strength_0_to_1, direction_bias +1/-1/0).
-    """
-    min_ticks = period * bar_size * 2
-    if len(prices) < min_ticks:
+
+    FIX: original set highs=lows=prices making TR=abs(prices[i]-prices[i])=0
+    always, so ATR=0 and adx_dir was permanently 0.0 (confirmed in trade logs).
+    For tick data TR must use consecutive price differences."""
+    if len(prices) < period * 2 + 2:
         return 20.0, 0.3, 0.0
-
-    # Aggregate into bar_size-tick bars using close prices
-    n_bars = len(prices) // bar_size
-    bars   = prices[:n_bars * bar_size].reshape(n_bars, bar_size)
-    # Use open (first) and close (last) of each bar for H/L approximation
-    highs  = np.max(bars, axis=1)
-    lows   = np.min(bars, axis=1)
-    closes = bars[:, -1]
-
-    if len(closes) < period * 2 + 1:
-        return 20.0, 0.3, 0.0
-
+    n = len(prices)
     tr_list, pdm_list, ndm_list = [], [], []
-    for i in range(1, len(closes)):
-        # True range using prior close as reference
-        tr  = max(highs[i] - lows[i],
-                  abs(highs[i] - closes[i-1]),
-                  abs(lows[i]  - closes[i-1]))
-        pdm = max(highs[i] - highs[i-1], 0.0)
-        ndm = max(lows[i-1] - lows[i],   0.0)
-        # Directional move convention: only count if dominant direction
-        if pdm > ndm:
-            ndm = 0.0
-        elif ndm > pdm:
-            pdm = 0.0
-        tr_list.append(tr)
-        pdm_list.append(pdm)
-        ndm_list.append(ndm)
-
+    for i in range(1, n):
+        tr  = abs(prices[i] - prices[i-1])          # tick-to-tick absolute move
+        pdm = max(prices[i] - prices[i-1], 0.0)     # positive directional move
+        ndm = max(prices[i-1] - prices[i], 0.0)     # negative directional move
+        tr_list.append(tr); pdm_list.append(pdm); ndm_list.append(ndm)
     tr_a  = np.array(tr_list[-period * 2:])
     pdm_a = np.array(pdm_list[-period * 2:])
     ndm_a = np.array(ndm_list[-period * 2:])
-
-    # Wilder smoothing (EMA-style)
-    def _wilder(arr, p):
-        if len(arr) < p:
-            return float(np.mean(arr))
-        s = float(np.sum(arr[:p]))
-        for v in arr[p:]:
-            s = s - s / p + v
-        return s / p
-
-    atr = _wilder(tr_a, period)
-    if atr < 1e-10:
+    atr   = np.mean(tr_a[-period:])
+    if atr == 0:
         return 20.0, 0.3, 0.0
-
-    pdi = 100 * _wilder(pdm_a, period) / atr
-    ndi = 100 * _wilder(ndm_a, period) / atr
+    pdi = 100 * np.mean(pdm_a[-period:]) / atr
+    ndi = 100 * np.mean(ndm_a[-period:]) / atr
     dx  = 100 * abs(pdi - ndi) / (pdi + ndi + 1e-9)
-
-    # Rolling DX for smoothed ADX
-    dx_list = []
-    for i in range(period, len(tr_a)):
-        t = _wilder(tr_a[:i+1], period)
-        if t < 1e-10:
-            continue
-        p_ = 100 * _wilder(pdm_a[:i+1], period) / t
-        n_ = 100 * _wilder(ndm_a[:i+1], period) / t
-        dx_list.append(100 * abs(p_ - n_) / (p_ + n_ + 1e-9))
-    adx = float(_wilder(np.array(dx_list), period)) if dx_list else dx
+    adx_vals = [100 * abs(pdm_a[i] - ndm_a[i]) / (np.mean(tr_a[max(0,i-period):i]) * period + 1e-9)
+                for i in range(period, len(tr_a))]
+    adx = float(np.mean(adx_vals)) if adx_vals else dx
     adx = float(np.clip(adx, 0, 100))
-
-    # Threshold tuned for bar-level data: ADX=15 → mild trend, ADX=32 → strong
+    # FIX v2: Lower trend threshold from 20 → 12 for tick data.
+    # Tick-level synthetic indices produce small consecutive moves so ADX
+    # rarely exceeds 20. The original threshold meant trend_strength=0 for
+    # virtually all trades (confirmed: adx layer_vote=0.0 on all 90 trades).
+    # At threshold 12 with a 20-point range, ADX=15 → strength=0.15 (mild),
+    # ADX=32 → strength=1.0 (strong). The direction signal (up_bias) fires
+    # even when the trend is moderate.
     trend_strength = float(np.clip((adx - 12) / 20, 0, 1))
     up_bias        = float(np.sign(pdi - ndi))
     return adx, trend_strength, up_bias
@@ -1632,15 +1581,7 @@ def sample_entropy_trust(returns, m=2, r_mult=0.2):
 # down-weighted. Permutation entropy (Bandt-Pompe) measures the predictability
 # of ordinal patterns in a short window of recent prices.
 PE_EMBED_DIM     = 5
-PE_THRESHOLD     = 0.85   # FIX v3: raised 0.82 → 0.85 based on live log analysis.
-                           # R_50 was producing PE=0.824-0.847 on every scan,
-                           # generating 331 entropy skips — nearly double the
-                           # layer-gate skips (161). This is not genuine market
-                           # randomness; it's the threshold sitting inside R_50's
-                           # natural tick-structure PE range. Genuinely chaotic
-                           # windows sit at PE=0.90+. 0.85 keeps the gate
-                           # meaningful while allowing R_50's structured windows
-                           # through to the downstream confluence/ensemble checks.
+PE_THRESHOLD     = 0.82   # skip trade if normalised PE >= this
 
 def permutation_entropy(prices, m=PE_EMBED_DIM):
     """
@@ -2967,45 +2908,24 @@ async def deep_startup_calibration(state, symbol_data, symbols):
         symbol_reports[s]    = report
 
         # ── Per-symbol threshold from THIS symbol's OOS confidence distribution
-        # Each symbol gets its own threshold derived from its own OOS confidence
-        # scores, not a pooled global number.
-        # FIX v3: Scale the threshold by the symbol's reliability score.
-        # Previously ALL symbols used ADAPTIVE_THRESHOLD_PERCENTILE=75 regardless
-        # of reliability. A low-reliability symbol (e.g. 0.3-0.6) that produces
-        # naturally noisy confidence scores ended up with a threshold it could
-        # never clear in live trading — confirmed: 6 of 8 symbols showed zero
-        # trades despite showing '8/8 ready' in the heartbeat. Now the percentile
-        # is inversely scaled by reliability: a very reliable symbol (1.2) still
-        # uses the 75th percentile bar; a low-reliability symbol (0.3) uses the
-        # 40th percentile bar — letting it compete at all rather than being
-        # silently frozen out by an impossible threshold.
-        sym_rel = state.reliability.get(s, 1.0)
-        rel_scaled_pct = int(np.clip(
-            ADAPTIVE_THRESHOLD_PERCENTILE * (sym_rel / 1.0),
-            35, ADAPTIVE_THRESHOLD_PERCENTILE
-        ))
+        # This is the key fix: each symbol gets its own threshold derived from
+        # its own OOS confidence scores, not a pooled global number.
         sym_confidences = report["all_confidences"]
         if sym_confidences:
             sym_thr = float(np.clip(
-                np.percentile(sym_confidences, rel_scaled_pct), 0.015, 0.55))
+                np.percentile(sym_confidences, ADAPTIVE_THRESHOLD_PERCENTILE), 0.02, 0.55))
+            # Quality gate: if fewer than 15% of OOS points clear this bar,
+            # lower it slightly to avoid starving good trades. If > 60% clear,
+            # raise it slightly to tighten precision.
             pct_clr = float(np.mean(np.array(sym_confidences) >= sym_thr))
-            # Safety valve: if still starved, drop further
-            if pct_clr < 0.10:
-                sym_thr = float(np.percentile(sym_confidences,
-                                              max(rel_scaled_pct - 15, 25)))
-                pct_clr = float(np.mean(np.array(sym_confidences) >= sym_thr))
+            if pct_clr < 0.15:
+                sym_thr = float(np.percentile(sym_confidences, max(ADAPTIVE_THRESHOLD_PERCENTILE - 15, 40)))
             elif pct_clr > 0.60:
-                sym_thr = float(np.percentile(sym_confidences,
-                                              min(rel_scaled_pct + 10, 80)))
-                pct_clr = float(np.mean(np.array(sym_confidences) >= sym_thr))
+                sym_thr = float(np.percentile(sym_confidences, min(ADAPTIVE_THRESHOLD_PERCENTILE + 10, 80)))
             state.per_symbol_threshold[s] = sym_thr
-            print(f"  Per-symbol thr    : {sym_thr:.4f}  "
-                  f"({pct_clr*100:.0f}% OOS points clear, "
-                  f"pct={rel_scaled_pct}, rel={sym_rel:.2f})")
+            print(f"  Per-symbol thr    : {sym_thr:.4f}  ({pct_clr*100:.0f}% OOS points clear)")
         else:
-            # No OOS confidence data — use a conservative fraction of the global
-            # threshold rather than the full bar which this symbol can't clear
-            state.per_symbol_threshold[s] = state.adaptive_threshold * max(sym_rel, 0.5)
+            state.per_symbol_threshold[s] = state.adaptive_threshold
 
         all_confidences.extend(sym_confidences)
         print(f"  Reliability       : {state.reliability[s]:.3f}")
@@ -3301,12 +3221,6 @@ async def main():
             print(f"[scan] balance={state.balance:.2f} | "
                   f"{len(ready_symbols)}/{len(symbols)} ready{rec}{s0_str}")
             last_heartbeat = now
-            # FIX v3: persist direction_history every heartbeat cycle so the
-            # bias-correction window survives Railway restarts reliably rather
-            # than only being saved when a trade closes (which gave only 3
-            # entries in the global_state table after a full session).
-            if _store is not None and len(state.direction_history) > 0:
-                _store.save_global_state(state)
 
         if not ready_symbols:
             continue
